@@ -3,7 +3,6 @@ name: Snowflake CI/CD Deploy
 on:
   # ---------------------------------------------------------
   # DEV deployment
-  # Existing behavior: deploy changed projects to DEV
   # ---------------------------------------------------------
   push:
     branches:
@@ -11,7 +10,6 @@ on:
 
   # ---------------------------------------------------------
   # DEV -> PROD promotion request
-  # This DOES NOT directly merge DEV into PROD.
   # ---------------------------------------------------------
   pull_request:
     types:
@@ -114,12 +112,6 @@ jobs:
           echo "Base: $PR_BASE_SHA"
           echo "Head: $PR_HEAD_SHA"
 
-          git diff \
-            --binary \
-            "$PR_BASE_SHA" \
-            "$PR_HEAD_SHA" \
-            -- projects/ > /tmp/all_changes.patch
-
           if [ -z "$PROJECTS" ]; then
             echo "No project selected."
             exit 1
@@ -151,6 +143,10 @@ jobs:
           done
 
 
+      # -------------------------------------------------------
+      # Show staged promotion changes
+      # -------------------------------------------------------
+
       - name: Show promoted changes
         run: |
 
@@ -159,26 +155,34 @@ jobs:
           git status --short
 
           echo ""
-          echo "Changed files:"
+          echo "Staged files:"
 
-          git diff --name-only
+          git diff --cached --name-only
 
+
+      # -------------------------------------------------------
+      # Commit selective promotion
+      # -------------------------------------------------------
 
       - name: Commit selective promotion
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
 
-          if git diff --quiet; then
-            echo "No changes to promote."
+          if git diff --cached --quiet; then
+            echo "No staged changes to promote."
             exit 0
           fi
 
-          git add projects/
+          echo "Committing selective promotion..."
 
           git commit \
             -m "Selective promotion from DEV PR #${PR_NUMBER}"
 
+
+      # -------------------------------------------------------
+      # Push promotion branch
+      # -------------------------------------------------------
 
       - name: Push promotion branch
         env:
@@ -190,6 +194,10 @@ jobs:
             origin \
             "$BRANCH_NAME"
 
+
+      # -------------------------------------------------------
+      # Create promotion PR
+      # -------------------------------------------------------
 
       - name: Create promotion PR
         env:
@@ -368,9 +376,7 @@ jobs:
   # =========================================================
   # 4. PROD DEPLOYMENT
   #
-  # IMPORTANT:
-  # This runs only AFTER the selective promotion PR
-  # is merged into PROD.
+  # Runs only after selective promotion PR is merged.
   # =========================================================
 
   detect-prod-projects:
@@ -482,7 +488,7 @@ jobs:
 
           mkdir -p "$(dirname "$KEY_PATH")"
 
-          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" \
             | tr -d '\r' > "$KEY_PATH"
 
       - name: Deploy changed PROD files
