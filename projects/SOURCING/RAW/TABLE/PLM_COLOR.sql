@@ -23,5 +23,6 @@ create or replace TABLE PLM_COLOR (
 	"Description" VARCHAR(4000),
 	"SAP Code" VARCHAR(4000),
 	"Department" VARCHAR(4000),
+	"Use" VARCHAR(4000),
 	"Color Category" VARCHAR(4000)
 );
