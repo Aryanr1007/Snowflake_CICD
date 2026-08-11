@@ -1,0 +1,64 @@
+{
+  "SCA_DEV": {
+    "snowflake": {
+      "account": "MF84543.snowflakecomputing.com",
+      "user": "SNOWFLAKECICD",
+      "role": "SUPPLY_CHAIN_ROLE",
+      "warehouse": "SCA_DEV_XS_WH",
+      "database": "SCA_DEV"
+    },
+    "key_path": "keys/sca_dev_key.p8",
+    "key_password": "Snowflakecicd",
+    "schemas": {
+      "XFRM": { "schema": "XFRM" },
+      "RPT": { "schema": "RPT" }
+    }
+  },
+  "SCA_PROD": {
+    "snowflake": {
+      "account": "MF84543.snowflakecomputing.com",
+      "user": "SNOWFLAKECICD",
+      "role": "SUPPLY_CHAIN_ROLE",
+      "warehouse": "SCA_PRD_XS_WH",
+      "database": "SCA"
+    },
+    "key_path": "keys/sca_prod_key.p8",
+    "key_password": "Snowflakecicd",
+    "schemas": {
+      "XFRM": { "schema": "XFRM" },
+      "RPT": { "schema": "RPT" }
+    }
+  },
+  "SOURCING_DEV": {
+    "snowflake": {
+      "account": "MF84543.snowflakecomputing.com",
+      "user": "SNOWFLAKECICD",
+      "role": "SOURCING_READ_WRITE_ROLE",
+      "warehouse": "SOURCING_DEV_XS_WH",
+      "database": "SOURCING_QA"
+    },
+    "key_path": "keys/sourcing_dev_key.p8",
+    "key_password": "Snowflakecicd",
+    "schemas": {
+      "RAW": { "schema": "RAW" },
+      "XFRM": { "schema": "XFRM" },
+      "RPT": { "schema": "RPT" }
+    }
+  },
+  "SOURCING_PROD": {
+    "snowflake": {
+      "account": "MF84543.snowflakecomputing.com",
+      "user": "SNOWFLAKECICD",
+      "role": "SOURCING_READ_WRITE_ROLE",
+      "warehouse": "SOURCING_PRD_XS_WH",
+      "database": "SOURCING"
+    },
+    "key_path": "keys/sourcing_prod_key.p8",
+    "key_password": "Snowflakecicd",
+    "schemas": {
+      "RAW": { "schema": "RAW" },
+      "XFRM": { "schema": "XFRM" },
+      "RPT": { "schema": "RPT" }
+    }
+  }
+}
