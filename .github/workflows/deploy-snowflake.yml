@@ -1,69 +1,312 @@
 name: Snowflake CI/CD Deploy
 
 on:
+  # ---------------------------------------------------------
+  # DEV deployment
+  # Existing behavior: deploy changed projects to DEV
+  # ---------------------------------------------------------
   push:
     branches:
       - DEV
+
+  # ---------------------------------------------------------
+  # DEV -> PROD promotion request
+  # This DOES NOT directly merge DEV into PROD.
+  # ---------------------------------------------------------
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - labeled
+    branches:
       - PROD
 
+
+permissions:
+  contents: write
+  pull-requests: write
+
+
 jobs:
-  detect-projects:
+
+  # =========================================================
+  # 1. SELECTIVE PROMOTION
+  # =========================================================
+
+  promote-to-prod:
+
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.ref == 'DEV' &&
+      github.event.pull_request.base.ref == 'PROD' &&
+      github.event.pull_request.state == 'open' &&
+      (
+        contains(github.event.pull_request.labels.*.name, 'promote-sourcing') ||
+        contains(github.event.pull_request.labels.*.name, 'promote-sca')
+      )
+
     runs-on: ubuntu-latest
-    outputs:
-      projects: ${{ steps.set-projects.outputs.projects }}
+
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v3
+
+      - name: Checkout PROD
+        uses: actions/checkout@v4
         with:
+          ref: PROD
           fetch-depth: 0
 
-      - id: set-projects
-        shell: bash
+      - name: Configure Git
         run: |
-          BRANCH_NAME="${GITHUB_REF##*/}"
-          echo "🔁 Running for branch: $BRANCH_NAME"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
 
-          if [[ "$BRANCH_NAME" == "DEV" ]]; then
-            SUFFIX="_DEV"
-          elif [[ "$BRANCH_NAME" == "PROD" ]]; then
-            SUFFIX="_PROD"
-          else
-            echo "❌ Unsupported branch: $BRANCH_NAME"
+      - name: Fetch DEV
+        run: |
+          git fetch origin DEV
+          git fetch origin PROD
+
+      - name: Determine selected projects
+        id: selection
+        shell: bash
+        env:
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+        run: |
+
+          echo "PR labels: $LABELS"
+
+          PROJECTS=""
+
+          if [[ "$LABELS" == *"promote-sourcing"* ]]; then
+            PROJECTS="${PROJECTS} SOURCING"
+          fi
+
+          if [[ "$LABELS" == *"promote-sca"* ]]; then
+            PROJECTS="${PROJECTS} SCA"
+          fi
+
+          echo "Selected projects:$PROJECTS"
+
+          echo "projects=$PROJECTS" >> "$GITHUB_OUTPUT"
+
+
+      - name: Create selective promotion branch
+        id: branch
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+
+          BRANCH_NAME="promote/pr-${PR_NUMBER}"
+
+          echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
+
+          git checkout -b "$BRANCH_NAME" origin/PROD
+
+
+      - name: Apply selected project changes
+        shell: bash
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PROJECTS: ${{ steps.selection.outputs.projects }}
+        run: |
+
+          echo "Comparing:"
+          echo "Base: $PR_BASE_SHA"
+          echo "Head: $PR_HEAD_SHA"
+
+          git diff \
+            --binary \
+            "$PR_BASE_SHA" \
+            "$PR_HEAD_SHA" \
+            -- projects/ > /tmp/all_changes.patch
+
+          if [ -z "$PROJECTS" ]; then
+            echo "No project selected."
             exit 1
           fi
 
-          git fetch origin $BRANCH_NAME --depth=50
-          PREV_COMMIT=$(git rev-parse HEAD~1)
+          for PROJECT in $PROJECTS
+          do
 
-          changed_files=$(git diff --name-only $PREV_COMMIT HEAD | grep '^projects/' | grep '\.sql$' || true)
+            echo "---------------------------------------"
+            echo "Promoting project: $PROJECT"
+            echo "---------------------------------------"
 
-          if [ -z "$changed_files" ]; then
-            echo "No changed .sql files."
-            echo "projects=[]" >> $GITHUB_OUTPUT
+            git diff \
+              --binary \
+              "$PR_BASE_SHA" \
+              "$PR_HEAD_SHA" \
+              -- "projects/$PROJECT/" \
+              > "/tmp/${PROJECT}.patch"
+
+            if [ ! -s "/tmp/${PROJECT}.patch" ]; then
+              echo "No changes found for $PROJECT"
+              continue
+            fi
+
+            git apply \
+              --3way \
+              "/tmp/${PROJECT}.patch"
+
+          done
+
+
+      - name: Show promoted changes
+        run: |
+
+          echo "Changes that will be promoted to PROD:"
+
+          git status --short
+
+          echo ""
+          echo "Changed files:"
+
+          git diff --name-only
+
+
+      - name: Commit selective promotion
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+
+          if git diff --quiet; then
+            echo "No changes to promote."
             exit 0
           fi
 
-          projects=$(echo "$changed_files" | awk -F/ '{print $2}' | sort -u | sed "s/$/${SUFFIX}/" | jq -R -s -c 'split("\n")[:-1]')
-          echo "Detected updated projects: $projects"
-          echo "projects=$projects" >> $GITHUB_OUTPUT
+          git add projects/
 
-  deploy:
-    needs: detect-projects
-    if: needs.detect-projects.outputs.projects != '[]' && !contains(github.event.head_commit.message, '[skip-deploy]')
+          git commit \
+            -m "Selective promotion from DEV PR #${PR_NUMBER}"
+
+
+      - name: Push promotion branch
+        env:
+          BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
+        run: |
+
+          git push \
+            --force-with-lease \
+            origin \
+            "$BRANCH_NAME"
+
+
+      - name: Create promotion PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+
+          EXISTING_PR=$(gh pr list \
+            --head "$BRANCH_NAME" \
+            --base PROD \
+            --json number \
+            --jq '.[0].number')
+
+          if [ -n "$EXISTING_PR" ]; then
+
+            echo "Promotion PR already exists: #$EXISTING_PR"
+
+          else
+
+            gh pr create \
+              --base PROD \
+              --head "$BRANCH_NAME" \
+              --title "Selective promotion from DEV PR #${PR_NUMBER}" \
+              --body "This PR contains only the explicitly selected stream changes from DEV PR #${PR_NUMBER}."
+
+          fi
+
+
+  # =========================================================
+  # 2. NORMAL DEV DEPLOYMENT
+  # =========================================================
+
+  detect-dev-projects:
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/DEV'
+
     runs-on: ubuntu-latest
+
+    outputs:
+      projects: ${{ steps.set-projects.outputs.projects }}
+
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect changed DEV projects
+        id: set-projects
+        shell: bash
+        run: |
+
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          changed_files=$(git diff \
+            --name-only \
+            "$PREV_COMMIT" \
+            HEAD \
+            | grep '^projects/' \
+            | grep '\.sql$' \
+            || true)
+
+          if [ -z "$changed_files" ]; then
+
+            echo "No changed SQL files."
+
+            echo "projects=[]" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+          echo "Changed files:"
+          echo "$changed_files"
+
+          projects=$(echo "$changed_files" \
+            | awk -F/ '{print $2}' \
+            | sort -u \
+            | sed 's/$/_DEV/' \
+            | jq -R -s -c 'split("\n")[:-1]')
+
+          echo "Detected projects: $projects"
+
+          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+
+
+  # =========================================================
+  # 3. DEPLOY TO DEV
+  # =========================================================
+
+  deploy-dev:
+
+    needs: detect-dev-projects
+
+    if: >
+      needs.detect-dev-projects.outputs.projects != '[]'
+
+    runs-on: ubuntu-latest
+
     strategy:
       matrix:
-        project: ${{ fromJson(needs.detect-projects.outputs.projects) }}
+        project: ${{ fromJson(needs.detect-dev-projects.outputs.projects) }}
+
     env:
       PROJECT: ${{ matrix.project }}
+
     steps:
+
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
@@ -73,43 +316,46 @@ jobs:
           pip install snowflake-connector-python cryptography
 
       - name: Parse project config and save private key
-        id: parse-config
         shell: bash
         run: |
+
           CONFIG_FILE=configs/config.json
-          if [ ! -f "$CONFIG_FILE" ]; then
-            echo "Config file not found: $CONFIG_FILE"
-            exit 1
-          fi
-          echo "Using config file: $CONFIG_FILE"
 
-          PROJECT_KEY="$PROJECT"
-          KEY_PATH=$(jq -r --arg key "$PROJECT_KEY" '.[$key].key_path' "$CONFIG_FILE")
-          echo "KEY_PATH=$KEY_PATH" >> $GITHUB_ENV
+          KEY_PATH=$(jq -r \
+            --arg key "$PROJECT" \
+            '.[$key].key_path' \
+            "$CONFIG_FILE")
 
-          mkdir -p $(dirname "$KEY_PATH")
-          echo "${{ secrets[ format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" | tr -d '\r' > "$KEY_PATH"
+          echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
 
-      - name: Run deployment script
+          mkdir -p "$(dirname "$KEY_PATH")"
+
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
+            | tr -d '\r' > "$KEY_PATH"
+
+      - name: Deploy changed DEV files
         env:
-          PROJECT: ${{ env.PROJECT }}
           CONFIG_FILE: configs/config.json
           SNOWFLAKE_PRIVATE_KEY_PATH: ${{ env.KEY_PATH }}
         run: |
-          BRANCH_NAME="${GITHUB_REF##*/}"
+
           BASE_PROJECT=$(echo "$PROJECT" | sed 's/_.*//')
 
-          git fetch origin $BRANCH_NAME --depth=50
           PREV_COMMIT=$(git rev-parse HEAD~1)
 
-          changed_files=$(git diff --name-only $PREV_COMMIT HEAD | grep "^projects/${BASE_PROJECT}/" | grep '\.sql$' || true)
+          changed_files=$(git diff \
+            --name-only \
+            "$PREV_COMMIT" \
+            HEAD \
+            | grep "^projects/${BASE_PROJECT}/" \
+            | grep '\.sql$' \
+            || true)
 
           if [ -z "$changed_files" ]; then
-            echo "No changed SQL files for project $BASE_PROJECT, skipping deployment."
+            echo "No changed SQL files."
             exit 0
           fi
 
-          echo "Deploying changed files for project $BASE_PROJECT:"
           echo "$changed_files"
 
           python deploy_sql_files.py \
@@ -118,22 +364,154 @@ jobs:
             --config_file "$CONFIG_FILE" \
             --key_path "$SNOWFLAKE_PRIVATE_KEY_PATH"
 
-  sync-prod-to-dev:
-    needs: deploy
-    if: github.ref == 'refs/heads/PROD' && needs.deploy.result == 'success'
+
+  # =========================================================
+  # 4. PROD DEPLOYMENT
+  #
+  # IMPORTANT:
+  # This runs only AFTER the selective promotion PR
+  # is merged into PROD.
+  # =========================================================
+
+  detect-prod-projects:
+
+    if: >
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/PROD'
+
     runs-on: ubuntu-latest
 
+    outputs:
+      projects: ${{ steps.set-projects.outputs.projects }}
+
     steps:
+
       - name: Checkout PROD
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
         with:
-          ref: PROD
           fetch-depth: 0
 
-      - name: Merge PROD into DEV
+      - name: Detect changed PROD projects
+        id: set-projects
+        shell: bash
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-          git fetch origin DEV
-          git checkout DEV
-          git merge --no-ff origin/PROD -m "Sync PROD into DEV after successful PROD deploy"
+
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          changed_files=$(git diff \
+            --name-only \
+            "$PREV_COMMIT" \
+            HEAD \
+            | grep '^projects/' \
+            | grep '\.sql$' \
+            || true)
+
+          if [ -z "$changed_files" ]; then
+
+            echo "No changed SQL files."
+
+            echo "projects=[]" >> "$GITHUB_OUTPUT"
+
+            exit 0
+
+          fi
+
+          echo "Changed PROD files:"
+          echo "$changed_files"
+
+          projects=$(echo "$changed_files" \
+            | awk -F/ '{print $2}' \
+            | sort -u \
+            | sed 's/$/_PROD/' \
+            | jq -R -s -c 'split("\n")[:-1]')
+
+          echo "Detected PROD projects: $projects"
+
+          echo "projects=$projects" >> "$GITHUB_OUTPUT"
+
+
+  # =========================================================
+  # 5. DEPLOY TO PROD
+  # =========================================================
+
+  deploy-prod:
+
+    needs: detect-prod-projects
+
+    if: >
+      needs.detect-prod-projects.outputs.projects != '[]'
+
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        project: ${{ fromJson(needs.detect-prod-projects.outputs.projects) }}
+
+    env:
+      PROJECT: ${{ matrix.project }}
+
+    steps:
+
+      - name: Checkout PROD
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install snowflake-connector-python cryptography
+
+      - name: Parse project config and save private key
+        shell: bash
+        run: |
+
+          CONFIG_FILE=configs/config.json
+
+          KEY_PATH=$(jq -r \
+            --arg key "$PROJECT" \
+            '.[$key].key_path' \
+            "$CONFIG_FILE")
+
+          echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
+          mkdir -p "$(dirname "$KEY_PATH")"
+
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
+            | tr -d '\r' > "$KEY_PATH"
+
+      - name: Deploy changed PROD files
+        env:
+          CONFIG_FILE: configs/config.json
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ env.KEY_PATH }}
+        run: |
+
+          BASE_PROJECT=$(echo "$PROJECT" | sed 's/_.*//')
+
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          changed_files=$(git diff \
+            --name-only \
+            "$PREV_COMMIT" \
+            HEAD \
+            | grep "^projects/${BASE_PROJECT}/" \
+            | grep '\.sql$' \
+            || true)
+
+          if [ -z "$changed_files" ]; then
+            echo "No changed SQL files."
+            exit 0
+          fi
+
+          echo "$changed_files"
+
+          python deploy_sql_files.py \
+            --project "$PROJECT" \
+            --files "$changed_files" \
+            --config_file "$CONFIG_FILE" \
+            --key_path "$SNOWFLAKE_PRIVATE_KEY_PATH"
