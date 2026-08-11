@@ -31,7 +31,7 @@ AS '
     lcscolor.createstampa2,
     lcscolor.modifystampa2,
    CASE 
-    WHEN LENGTH(wttypedefinition.name) - LENGTH(REPLACE(wttypedefinition.name, ''.'', '''')) >= 2
+    WHEN LENGTH(wttypedefinition.name) - LENGTH(REPLACE(wttypedefinition.name, ''.'', '''')) >= 3
     THEN SPLIT_PART(
             SPLIT_PART(wttypedefinition.name, ''.'', 3),
             ''_'',
