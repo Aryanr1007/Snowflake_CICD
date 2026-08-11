@@ -12,7 +12,6 @@ create or replace view VW_PLM_COLOR(
 	"Print Pattern Color Description",
 	"Description",
 	"SAP Code",
-	"Use",
 	"Color Category"
 ) as
 SELECT 
@@ -29,7 +28,6 @@ SELECT
 "Print Pattern Color Description",
 "Description",
 "SAP Code",
-"Use",
 "Color Category"
 
 FROM
