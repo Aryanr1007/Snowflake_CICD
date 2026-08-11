@@ -1,7 +1,7 @@
 {
   "SCA_DEV": {
     "snowflake": {
-      "account": "MF84543.snowflakecomputing.com",
+      "account": "LDMUIOK-EC08288.snowflakecomputing.com",
       "user": "SNOWFLAKECICD",
       "role": "SUPPLY_CHAIN_ROLE",
       "warehouse": "SCA_DEV_XS_WH",
@@ -16,7 +16,7 @@
   },
   "SCA_PROD": {
     "snowflake": {
-      "account": "MF84543.snowflakecomputing.com",
+      "account": "LDMUIOK-EC08288.snowflakecomputing.com",
       "user": "SNOWFLAKECICD",
       "role": "SUPPLY_CHAIN_ROLE",
       "warehouse": "SCA_PRD_XS_WH",
@@ -31,7 +31,7 @@
   },
   "SOURCING_DEV": {
     "snowflake": {
-      "account": "MF84543.snowflakecomputing.com",
+      "account": "LDMUIOK-EC08288.snowflakecomputing.com",
       "user": "SNOWFLAKECICD",
       "role": "SOURCING_READ_WRITE_ROLE",
       "warehouse": "SOURCING_DEV_XS_WH",
@@ -47,7 +47,7 @@
   },
   "SOURCING_PROD": {
     "snowflake": {
-      "account": "MF84543.snowflakecomputing.com",
+      "account": "LDMUIOK-EC08288.snowflakecomputing.com",
       "user": "SNOWFLAKECICD",
       "role": "SOURCING_READ_WRITE_ROLE",
       "warehouse": "SOURCING_PRD_XS_WH",
