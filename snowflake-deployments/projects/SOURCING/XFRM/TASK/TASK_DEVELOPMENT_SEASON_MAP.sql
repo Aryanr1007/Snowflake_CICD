@@ -1,0 +1,4 @@
+create or replace task TASK_DEVELOPMENT_SEASON_MAP
+	warehouse=SOURCING_PRD_XS_WH
+	schedule='USING CRON 30 7 * * * EST5EDT'
+	as CALL USP_DEVELOPMENT_SEASON_MAP();

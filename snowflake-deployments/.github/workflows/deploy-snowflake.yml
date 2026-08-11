@@ -1,0 +1,139 @@
+name: Snowflake CI/CD Deploy
+
+on:
+  push:
+    branches:
+      - DEV
+      - PROD
+
+jobs:
+  detect-projects:
+    runs-on: ubuntu-latest
+    outputs:
+      projects: ${{ steps.set-projects.outputs.projects }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - id: set-projects
+        shell: bash
+        run: |
+          BRANCH_NAME="${GITHUB_REF##*/}"
+          echo "🔁 Running for branch: $BRANCH_NAME"
+
+          if [[ "$BRANCH_NAME" == "DEV" ]]; then
+            SUFFIX="_DEV"
+          elif [[ "$BRANCH_NAME" == "PROD" ]]; then
+            SUFFIX="_PROD"
+          else
+            echo "❌ Unsupported branch: $BRANCH_NAME"
+            exit 1
+          fi
+
+          git fetch origin $BRANCH_NAME --depth=50
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          changed_files=$(git diff --name-only $PREV_COMMIT HEAD | grep '^projects/' | grep '\.sql$' || true)
+
+          if [ -z "$changed_files" ]; then
+            echo "No changed .sql files."
+            echo "projects=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          projects=$(echo "$changed_files" | awk -F/ '{print $2}' | sort -u | sed "s/$/${SUFFIX}/" | jq -R -s -c 'split("\n")[:-1]')
+          echo "Detected updated projects: $projects"
+          echo "projects=$projects" >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: detect-projects
+    if: needs.detect-projects.outputs.projects != '[]' && !contains(github.event.head_commit.message, '[skip-deploy]')
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        project: ${{ fromJson(needs.detect-projects.outputs.projects) }}
+    env:
+      PROJECT: ${{ matrix.project }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install snowflake-connector-python cryptography
+
+      - name: Parse project config and save private key
+        id: parse-config
+        shell: bash
+        run: |
+          CONFIG_FILE=configs/config.json
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Config file not found: $CONFIG_FILE"
+            exit 1
+          fi
+          echo "Using config file: $CONFIG_FILE"
+
+          PROJECT_KEY="$PROJECT"
+          KEY_PATH=$(jq -r --arg key "$PROJECT_KEY" '.[$key].key_path' "$CONFIG_FILE")
+          echo "KEY_PATH=$KEY_PATH" >> $GITHUB_ENV
+
+          mkdir -p $(dirname "$KEY_PATH")
+          echo "${{ secrets[ format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" | tr -d '\r' > "$KEY_PATH"
+
+      - name: Run deployment script
+        env:
+          PROJECT: ${{ env.PROJECT }}
+          CONFIG_FILE: configs/config.json
+          SNOWFLAKE_PRIVATE_KEY_PATH: ${{ env.KEY_PATH }}
+        run: |
+          BRANCH_NAME="${GITHUB_REF##*/}"
+          BASE_PROJECT=$(echo "$PROJECT" | sed 's/_.*//')
+
+          git fetch origin $BRANCH_NAME --depth=50
+          PREV_COMMIT=$(git rev-parse HEAD~1)
+
+          changed_files=$(git diff --name-only $PREV_COMMIT HEAD | grep "^projects/${BASE_PROJECT}/" | grep '\.sql$' || true)
+
+          if [ -z "$changed_files" ]; then
+            echo "No changed SQL files for project $BASE_PROJECT, skipping deployment."
+            exit 0
+          fi
+
+          echo "Deploying changed files for project $BASE_PROJECT:"
+          echo "$changed_files"
+
+          python deploy_sql_files.py \
+            --project "$PROJECT" \
+            --files "$changed_files" \
+            --config_file "$CONFIG_FILE" \
+            --key_path "$SNOWFLAKE_PRIVATE_KEY_PATH"
+
+  sync-prod-to-dev:
+    needs: deploy
+    if: github.ref == 'refs/heads/PROD' && needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PROD
+        uses: actions/checkout@v3
+        with:
+          ref: PROD
+          fetch-depth: 0
+
+      - name: Merge PROD into DEV
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git fetch origin DEV
+          git checkout DEV
+          git merge --no-ff origin/PROD -m "Sync PROD into DEV after successful PROD deploy"
