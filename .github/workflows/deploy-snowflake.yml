@@ -13,10 +13,12 @@ on:
   # =========================================================
   # DEV -> PROD PROMOTION REQUEST
   #
-  # A DEV -> PROD PR must have a promotion label.
+  # A DEV -> PROD PR must have exactly ONE promotion label:
   #
   # promote-sourcing -> promote only SOURCING
   # promote-sca      -> promote only SCA
+  #
+  # Without a valid label, the PR is automatically closed.
   # =========================================================
 
   pull_request:
@@ -36,11 +38,20 @@ permissions:
 
 jobs:
 
-    # =========================================================
+  # =========================================================
   # 1. VALIDATE PROMOTION PR
   #
-  # If a DEV -> PROD PR does not have a promotion label,
-  # automatically close it.
+  # A DEV -> PROD PR must have exactly ONE valid promotion
+  # label.
+  #
+  # No label:
+  #   -> Close PR
+  #
+  # Both labels:
+  #   -> Close PR
+  #
+  # Exactly one label:
+  #   -> Allow promotion workflow
   # =========================================================
 
   validate-promotion-pr:
@@ -53,31 +64,69 @@ jobs:
       (
         github.event.action == 'opened' ||
         github.event.action == 'synchronize' ||
+        github.event.action == 'labeled' ||
         github.event.action == 'unlabeled'
       ) &&
-      !contains(github.event.pull_request.labels.*.name, 'promote-sourcing') &&
-      !contains(github.event.pull_request.labels.*.name, 'promote-sca')
+      (
+        !contains(github.event.pull_request.labels.*.name, 'promote-sourcing') ||
+        !contains(github.event.pull_request.labels.*.name, 'promote-sca') ||
+        contains(github.event.pull_request.labels.*.name, 'promote-sourcing')
+        && contains(github.event.pull_request.labels.*.name, 'promote-sca')
+      )
 
     runs-on: ubuntu-latest
 
     steps:
 
-      - name: Reject PR without promotion label
+      - name: Validate promotion label
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
         run: |
 
-          echo "ERROR: No promotion label found."
-          echo "Required label: promote-sourcing OR promote-sca"
+          echo "PR labels: $LABELS"
+
+          HAS_SOURCING=false
+          HAS_SCA=false
+
+          if [[ ",$LABELS," == *",promote-sourcing,"* ]]; then
+            HAS_SOURCING=true
+          fi
+
+          if [[ ",$LABELS," == *",promote-sca,"* ]]; then
+            HAS_SCA=true
+          fi
+
+
+          if [[ "$HAS_SOURCING" == "true" && "$HAS_SCA" == "true" ]]; then
+
+            MESSAGE="This DEV to PROD PR was automatically closed because both promotion labels were added. Please create a new DEV to PROD PR and select exactly one label: promote-sourcing OR promote-sca."
+
+          elif [[ "$HAS_SOURCING" == "false" && "$HAS_SCA" == "false" ]]; then
+
+            MESSAGE="This DEV to PROD PR was automatically closed because no promotion label was provided. Please create a new DEV to PROD PR and add exactly one label: promote-sourcing OR promote-sca."
+
+          else
+
+            echo "Exactly one valid promotion label is present."
+            exit 0
+
+          fi
+
+
+          echo "$MESSAGE"
+
 
           gh pr comment "$PR_NUMBER" \
             --repo "$GH_REPO" \
-            --body "This DEV to PROD PR was automatically closed because no promotion label was provided. Add the promote-sourcing or promote-sca label when creating the promotion request."
+            --body "$MESSAGE"
+
 
           gh pr close "$PR_NUMBER" \
             --repo "$GH_REPO"
+
 
           echo "Original PR #$PR_NUMBER closed successfully."
 
@@ -85,9 +134,14 @@ jobs:
   # =========================================================
   # 2. SELECTIVE PROMOTION
   #
-  # This job runs ONLY when a promotion label is added.
+  # IMPORTANT:
   #
-  # It does NOT run on every DEV update.
+  # This job runs ONLY when a promotion label is ADDED.
+  #
+  # It does NOT run on synchronize.
+  #
+  # Therefore, additional DEV changes will not automatically
+  # trigger another promotion.
   # =========================================================
 
   promote-to-prod:
@@ -101,6 +155,10 @@ jobs:
       (
         github.event.label.name == 'promote-sourcing' ||
         github.event.label.name == 'promote-sca'
+      ) &&
+      !(
+        contains(github.event.pull_request.labels.*.name, 'promote-sourcing') &&
+        contains(github.event.pull_request.labels.*.name, 'promote-sca')
       )
 
     runs-on: ubuntu-latest
@@ -140,9 +198,6 @@ jobs:
 
       # -------------------------------------------------------
       # Determine selected project
-      #
-      # Only the label added by this event determines
-      # what is being promoted.
       # -------------------------------------------------------
 
       - name: Determine selected project
@@ -154,6 +209,7 @@ jobs:
 
           echo "Promotion label added: $LABEL"
 
+
           if [[ "$LABEL" == "promote-sourcing" ]]; then
 
             PROJECT="SOURCING"
@@ -164,10 +220,11 @@ jobs:
 
           else
 
-            echo "Invalid promotion label: $LABEL"
+            echo "ERROR: Invalid promotion label: $LABEL"
             exit 1
 
           fi
+
 
           echo "Selected project: $PROJECT"
 
@@ -177,7 +234,7 @@ jobs:
       # -------------------------------------------------------
       # Create selective promotion branch
       #
-      # Branch starts from current PROD.
+      # Branch starts from CURRENT PROD.
       # -------------------------------------------------------
 
       - name: Create selective promotion branch
@@ -190,15 +247,25 @@ jobs:
 
           echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
-          # Reset/create local promotion branch from current PROD.
+
+          # Always recreate local branch from current PROD.
           git checkout -B "$BRANCH_NAME" origin/PROD
 
 
       # -------------------------------------------------------
       # Apply ONLY selected project changes
       #
-      # Compare DEV PR base -> DEV PR head.
-      # Only the selected project folder is extracted.
+      # Compare:
+      #
+      # DEV PR base -> DEV PR head
+      #
+      # Then extract ONLY:
+      #
+      # projects/SOURCING/
+      #
+      # OR
+      #
+      # projects/SCA/
       # -------------------------------------------------------
 
       - name: Apply selected project changes
@@ -209,16 +276,18 @@ jobs:
           PROJECT: ${{ steps.selection.outputs.project }}
         run: |
 
-          echo "---------------------------------------"
+          echo "======================================="
           echo "Selective Promotion"
-          echo "---------------------------------------"
+          echo "======================================="
 
           echo "Base commit : $PR_BASE_SHA"
           echo "Head commit : $PR_HEAD_SHA"
           echo "Project     : $PROJECT"
 
+
           echo ""
-          echo "Changes in DEV PR for selected project:"
+          echo "Changes in selected project:"
+
 
           git diff \
             --name-status \
@@ -249,13 +318,14 @@ jobs:
           echo ""
           echo "Applying selected project changes..."
 
+
           git apply \
             --3way \
             "/tmp/${PROJECT}.patch"
 
 
       # -------------------------------------------------------
-      # Show staged promotion changes
+      # Show promoted changes
       # -------------------------------------------------------
 
       - name: Show promoted changes
@@ -265,15 +335,18 @@ jobs:
           echo "Changes that will be promoted to PROD"
           echo "======================================="
 
+
           echo ""
           echo "Git status:"
 
           git status --short
 
+
           echo ""
           echo "Staged files:"
 
           git diff --cached --name-status
+
 
           echo ""
           echo "Staged file count:"
@@ -283,9 +356,6 @@ jobs:
 
       # -------------------------------------------------------
       # Commit selective promotion
-      #
-      # git apply stages the selected changes, therefore
-      # git diff --cached is used.
       # -------------------------------------------------------
 
       - name: Commit selective promotion
@@ -308,6 +378,7 @@ jobs:
 
           echo "Committing selective promotion..."
 
+
           git commit \
             -m "Selective promotion of ${PROJECT} from DEV PR #${PR_NUMBER}"
 
@@ -323,13 +394,14 @@ jobs:
 
           echo "Pushing promotion branch: $BRANCH_NAME"
 
+
           git push \
             --force-with-lease \
             origin \
             "$BRANCH_NAME"
 
 
-           # -------------------------------------------------------
+      # -------------------------------------------------------
       # Create Promotion PR
       #
       # IMPORTANT:
@@ -340,6 +412,7 @@ jobs:
         id: create-promotion-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PROJECT: ${{ steps.selection.outputs.project }}
@@ -347,7 +420,9 @@ jobs:
 
           echo "Checking for existing Promotion PR..."
 
+
           EXISTING_PR=$(gh pr list \
+            --repo "$GH_REPO" \
             --head "$BRANCH_NAME" \
             --base PROD \
             --state open \
@@ -365,21 +440,25 @@ jobs:
 
             echo "Creating Promotion PR..."
 
-            gh pr create \
+
+            PROMOTION_PR_URL=$(gh pr create \
+              --repo "$GH_REPO" \
               --base PROD \
               --head "$BRANCH_NAME" \
               --title "Selective ${PROJECT} promotion from DEV PR #${PR_NUMBER}" \
-              --body "This PR contains only the ${PROJECT} changes selected for promotion from DEV PR #${PR_NUMBER}."
+              --body "This PR contains only the ${PROJECT} changes selected for promotion from DEV PR #${PR_NUMBER}.")
 
-            echo "Promotion PR created."
 
-            # Find the newly created PR number
-            PROMOTION_PR=$(gh pr list \
-              --head "$BRANCH_NAME" \
-              --base PROD \
-              --state open \
+            echo "Promotion PR URL: $PROMOTION_PR_URL"
+
+
+            # Get PR number from the URL.
+            PROMOTION_PR=$(gh pr view \
+              "$PROMOTION_PR_URL" \
+              --repo "$GH_REPO" \
               --json number \
-              --jq '.[0].number')
+              --jq '.number')
+
 
           fi
 
@@ -397,18 +476,20 @@ jobs:
 
           echo "Promotion PR: #$PROMOTION_PR"
 
+
           echo "promotion_pr=$PROMOTION_PR" >> "$GITHUB_OUTPUT"
 
 
       # -------------------------------------------------------
       # Close original DEV -> PROD PR
       #
-      # This happens ONLY after Promotion PR exists.
+      # ONLY happens after Promotion PR exists.
       # -------------------------------------------------------
 
       - name: Close original DEV to PROD PR
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           ORIGINAL_PR: ${{ github.event.pull_request.number }}
           PROMOTION_PR: ${{ steps.create-promotion-pr.outputs.promotion_pr }}
           PROJECT: ${{ steps.selection.outputs.project }}
@@ -427,14 +508,17 @@ jobs:
 
           echo "Promotion PR #$PROMOTION_PR exists."
 
+
           echo "Closing original DEV -> PROD PR #$ORIGINAL_PR"
 
 
           gh pr comment "$ORIGINAL_PR" \
-            --body "Selective promotion for **${PROJECT}** has been created as PR #${PROMOTION_PR}. This original DEV → PROD PR is being automatically closed. Please review and merge the selective promotion PR."
+            --repo "$GH_REPO" \
+            --body "Selective promotion for **${PROJECT}** has been created as PR #${PROMOTION_PR}. This original DEV to PROD PR is being automatically closed. Please review and merge the selective promotion PR."
 
 
-          gh pr close "$ORIGINAL_PR"
+          gh pr close "$ORIGINAL_PR" \
+            --repo "$GH_REPO"
 
 
           echo "Original DEV -> PROD PR #$ORIGINAL_PR closed successfully."
@@ -467,6 +551,7 @@ jobs:
         run: |
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
+
 
           changed_files=$(git diff \
             --name-only \
@@ -550,6 +635,7 @@ jobs:
 
           CONFIG_FILE=configs/config.json
 
+
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "Config file not found: $CONFIG_FILE"
             exit 1
@@ -568,7 +654,7 @@ jobs:
           mkdir -p "$(dirname "$KEY_PATH")"
 
 
-          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" \
             | tr -d '\r' > "$KEY_PATH"
 
 
@@ -579,6 +665,7 @@ jobs:
         run: |
 
           BASE_PROJECT=$(echo "$PROJECT" | sed 's/_.*//')
+
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
 
@@ -683,6 +770,9 @@ jobs:
 
   # =========================================================
   # 6. DEPLOY TO PROD
+  #
+  # This runs after the selective Promotion PR is merged
+  # into PROD.
   # =========================================================
 
   deploy-prod:
@@ -727,6 +817,7 @@ jobs:
 
           CONFIG_FILE=configs/config.json
 
+
           if [ ! -f "$CONFIG_FILE" ]; then
             echo "Config file not found: $CONFIG_FILE"
             exit 1
@@ -745,7 +836,7 @@ jobs:
           mkdir -p "$(dirname "$KEY_PATH")"
 
 
-          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" \
             | tr -d '\r' > "$KEY_PATH"
 
 
@@ -756,6 +847,7 @@ jobs:
         run: |
 
           BASE_PROJECT=$(echo "$PROJECT" | sed 's/_.*//')
+
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
 
