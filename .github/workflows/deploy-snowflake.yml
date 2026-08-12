@@ -329,7 +329,7 @@ jobs:
             "$BRANCH_NAME"
 
 
-      # -------------------------------------------------------
+           # -------------------------------------------------------
       # Create Promotion PR
       #
       # IMPORTANT:
@@ -365,22 +365,28 @@ jobs:
 
             echo "Creating Promotion PR..."
 
-            PROMOTION_PR=$(gh pr create \
+            gh pr create \
               --base PROD \
               --head "$BRANCH_NAME" \
               --title "Selective ${PROJECT} promotion from DEV PR #${PR_NUMBER}" \
-              --body "This PR contains only the ${PROJECT} changes selected for promotion from DEV PR #${PR_NUMBER}." \
-              --json number \
-              --jq '.number')
+              --body "This PR contains only the ${PROJECT} changes selected for promotion from DEV PR #${PR_NUMBER}."
 
-            echo "Promotion PR created: #$PROMOTION_PR"
+            echo "Promotion PR created."
+
+            # Find the newly created PR number
+            PROMOTION_PR=$(gh pr list \
+              --head "$BRANCH_NAME" \
+              --base PROD \
+              --state open \
+              --json number \
+              --jq '.[0].number')
 
           fi
 
 
           if [ -z "$PROMOTION_PR" ]; then
 
-            echo "ERROR: Promotion PR was not created."
+            echo "ERROR: Promotion PR number could not be determined."
 
             echo "The original DEV -> PROD PR will NOT be closed."
 
@@ -388,6 +394,8 @@ jobs:
 
           fi
 
+
+          echo "Promotion PR: #$PROMOTION_PR"
 
           echo "promotion_pr=$PROMOTION_PR" >> "$GITHUB_OUTPUT"
 
