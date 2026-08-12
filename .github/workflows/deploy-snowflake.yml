@@ -1,21 +1,30 @@
 name: Snowflake CI/CD Deploy
 
 on:
-  # ---------------------------------------------------------
-  # DEV deployment
-  # ---------------------------------------------------------
+
+  # =========================================================
+  # DEV DEPLOYMENT
+  # =========================================================
+
   push:
     branches:
       - DEV
 
-  # ---------------------------------------------------------
-  # DEV -> PROD promotion request
-  # ---------------------------------------------------------
+  # =========================================================
+  # DEV -> PROD PROMOTION REQUEST
+  #
+  # A DEV -> PROD PR must have a promotion label.
+  #
+  # promote-sourcing -> promote only SOURCING
+  # promote-sca      -> promote only SCA
+  # =========================================================
+
   pull_request:
     types:
       - opened
       - synchronize
       - labeled
+      - unlabeled
     branches:
       - PROD
 
@@ -28,10 +37,15 @@ permissions:
 jobs:
 
   # =========================================================
-  # 1. SELECTIVE PROMOTION
+  # 1. VALIDATE PROMOTION PR
+  #
+  # If a DEV -> PROD PR does not have a valid promotion label,
+  # automatically close it.
+  #
+  # This job NEVER performs deployment.
   # =========================================================
 
-  promote-to-prod:
+  validate-promotion-pr:
 
     if: >
       github.event_name == 'pull_request' &&
@@ -39,13 +53,62 @@ jobs:
       github.event.pull_request.base.ref == 'PROD' &&
       github.event.pull_request.state == 'open' &&
       (
-        contains(github.event.pull_request.labels.*.name, 'promote-sourcing') ||
-        contains(github.event.pull_request.labels.*.name, 'promote-sca')
+        github.event.action == 'opened' ||
+        github.event.action == 'synchronize' ||
+        github.event.action == 'unlabeled'
+      ) &&
+      !contains(github.event.pull_request.labels.*.name, 'promote-sourcing') &&
+      !contains(github.event.pull_request.labels.*.name, 'promote-sca')
+
+    runs-on: ubuntu-latest
+
+    steps:
+
+      - name: Reject PR without promotion label
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+
+          echo "ERROR: No promotion label found."
+          echo "Required label: promote-sourcing OR promote-sca"
+
+          gh pr comment "$PR_NUMBER" \
+            --body "This DEV → PROD PR was automatically closed because no promotion label was provided. Add `promote-sourcing` or `promote-sca` when creating the promotion request."
+
+          gh pr close "$PR_NUMBER"
+
+          echo "Original PR #$PR_NUMBER closed."
+
+
+  # =========================================================
+  # 2. SELECTIVE PROMOTION
+  #
+  # This job runs ONLY when a promotion label is added.
+  #
+  # It does NOT run on every DEV update.
+  # =========================================================
+
+  promote-to-prod:
+
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      github.event.pull_request.head.ref == 'DEV' &&
+      github.event.pull_request.base.ref == 'PROD' &&
+      github.event.pull_request.state == 'open' &&
+      (
+        github.event.label.name == 'promote-sourcing' ||
+        github.event.label.name == 'promote-sca'
       )
 
     runs-on: ubuntu-latest
 
     steps:
+
+      # -------------------------------------------------------
+      # Checkout current PROD
+      # -------------------------------------------------------
 
       - name: Checkout PROD
         uses: actions/checkout@v4
@@ -53,51 +116,67 @@ jobs:
           ref: PROD
           fetch-depth: 0
 
+
+      # -------------------------------------------------------
+      # Configure Git
+      # -------------------------------------------------------
+
       - name: Configure Git
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
+
+
+      # -------------------------------------------------------
+      # Fetch DEV and PROD
+      # -------------------------------------------------------
 
       - name: Fetch DEV and PROD
         run: |
           git fetch origin DEV
           git fetch origin PROD
 
+
       # -------------------------------------------------------
-      # Determine which stream(s) should be promoted
+      # Determine selected project
+      #
+      # Only the label added by this event determines
+      # what is being promoted.
       # -------------------------------------------------------
 
-      - name: Determine selected projects
+      - name: Determine selected project
         id: selection
         shell: bash
         env:
-          LABELS: ${{ join(github.event.pull_request.labels.*.name, ',') }}
+          LABEL: ${{ github.event.label.name }}
         run: |
 
-          echo "PR labels: $LABELS"
+          echo "Promotion label added: $LABEL"
 
-          PROJECTS=""
+          if [[ "$LABEL" == "promote-sourcing" ]]; then
 
-          if [[ "$LABELS" == *"promote-sourcing"* ]]; then
-            PROJECTS="${PROJECTS} SOURCING"
-          fi
+            PROJECT="SOURCING"
 
-          if [[ "$LABELS" == *"promote-sca"* ]]; then
-            PROJECTS="${PROJECTS} SCA"
-          fi
+          elif [[ "$LABEL" == "promote-sca" ]]; then
 
-          if [ -z "$PROJECTS" ]; then
-            echo "No valid promotion label found."
+            PROJECT="SCA"
+
+          else
+
+            echo "Invalid promotion label: $LABEL"
             exit 1
+
           fi
 
-          echo "Selected projects:$PROJECTS"
+          echo "Selected project: $PROJECT"
 
-          echo "projects=$PROJECTS" >> "$GITHUB_OUTPUT"
+          echo "project=$PROJECT" >> "$GITHUB_OUTPUT"
 
 
       # -------------------------------------------------------
-      # Create / reset selective promotion branch from PROD
+      # Create selective promotion branch
+      #
+      # Branch starts from current PROD.
       # -------------------------------------------------------
 
       - name: Create selective promotion branch
@@ -110,12 +189,15 @@ jobs:
 
           echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
-          # Reset local promotion branch to current PROD
+          # Reset/create local promotion branch from current PROD.
           git checkout -B "$BRANCH_NAME" origin/PROD
 
 
       # -------------------------------------------------------
-      # Apply ONLY selected project changes from DEV PR
+      # Apply ONLY selected project changes
+      #
+      # Compare DEV PR base -> DEV PR head.
+      # Only the selected project folder is extracted.
       # -------------------------------------------------------
 
       - name: Apply selected project changes
@@ -123,37 +205,52 @@ jobs:
         env:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          PROJECTS: ${{ steps.selection.outputs.projects }}
+          PROJECT: ${{ steps.selection.outputs.project }}
         run: |
 
-          echo "Comparing:"
-          echo "Base: $PR_BASE_SHA"
-          echo "Head: $PR_HEAD_SHA"
+          echo "---------------------------------------"
+          echo "Selective Promotion"
+          echo "---------------------------------------"
 
-          for PROJECT in $PROJECTS
-          do
+          echo "Base commit : $PR_BASE_SHA"
+          echo "Head commit : $PR_HEAD_SHA"
+          echo "Project     : $PROJECT"
 
-            echo "---------------------------------------"
-            echo "Promoting project: $PROJECT"
-            echo "---------------------------------------"
+          echo ""
+          echo "Changes in DEV PR for selected project:"
 
-            git diff \
-              --binary \
-              "$PR_BASE_SHA" \
-              "$PR_HEAD_SHA" \
-              -- "projects/$PROJECT/" \
-              > "/tmp/${PROJECT}.patch"
+          git diff \
+            --name-status \
+            "$PR_BASE_SHA" \
+            "$PR_HEAD_SHA" \
+            -- "projects/$PROJECT/"
 
-            if [ ! -s "/tmp/${PROJECT}.patch" ]; then
-              echo "No changes found for $PROJECT"
-              continue
-            fi
 
-            git apply \
-              --3way \
-              "/tmp/${PROJECT}.patch"
+          git diff \
+            --binary \
+            "$PR_BASE_SHA" \
+            "$PR_HEAD_SHA" \
+            -- "projects/$PROJECT/" \
+            > "/tmp/${PROJECT}.patch"
 
-          done
+
+          if [ ! -s "/tmp/${PROJECT}.patch" ]; then
+
+            echo "ERROR: No changes found for selected project: $PROJECT"
+
+            echo "The original DEV -> PROD PR will NOT be closed."
+
+            exit 1
+
+          fi
+
+
+          echo ""
+          echo "Applying selected project changes..."
+
+          git apply \
+            --3way \
+            "/tmp/${PROJECT}.patch"
 
 
       # -------------------------------------------------------
@@ -163,36 +260,55 @@ jobs:
       - name: Show promoted changes
         run: |
 
-          echo "Changes that will be promoted to PROD:"
+          echo "======================================="
+          echo "Changes that will be promoted to PROD"
+          echo "======================================="
+
+          echo ""
+          echo "Git status:"
 
           git status --short
 
           echo ""
           echo "Staged files:"
 
-          git diff --cached --name-only
+          git diff --cached --name-status
+
+          echo ""
+          echo "Staged file count:"
+
+          git diff --cached --name-only | wc -l
 
 
       # -------------------------------------------------------
       # Commit selective promotion
+      #
+      # git apply stages the selected changes, therefore
+      # git diff --cached is used.
       # -------------------------------------------------------
 
       - name: Commit selective promotion
         id: commit-promotion
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT: ${{ steps.selection.outputs.project }}
         run: |
 
           if git diff --cached --quiet; then
+
             echo "ERROR: No staged changes to promote."
+
             echo "The original DEV -> PROD PR will NOT be closed."
+
             exit 1
+
           fi
+
 
           echo "Committing selective promotion..."
 
           git commit \
-            -m "Selective promotion from DEV PR #${PR_NUMBER}"
+            -m "Selective promotion of ${PROJECT} from DEV PR #${PR_NUMBER}"
 
 
       # -------------------------------------------------------
@@ -204,6 +320,8 @@ jobs:
           BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
         run: |
 
+          echo "Pushing promotion branch: $BRANCH_NAME"
+
           git push \
             --force-with-lease \
             origin \
@@ -211,7 +329,10 @@ jobs:
 
 
       # -------------------------------------------------------
-      # Create promotion PR
+      # Create Promotion PR
+      #
+      # IMPORTANT:
+      # Original PR is NOT closed until this succeeds.
       # -------------------------------------------------------
 
       - name: Create promotion PR
@@ -220,7 +341,10 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PROJECT: ${{ steps.selection.outputs.project }}
         run: |
+
+          echo "Checking for existing Promotion PR..."
 
           EXISTING_PR=$(gh pr list \
             --head "$BRANCH_NAME" \
@@ -229,33 +353,48 @@ jobs:
             --json number \
             --jq '.[0].number')
 
+
           if [ -n "$EXISTING_PR" ]; then
 
             echo "Promotion PR already exists: #$EXISTING_PR"
 
-            echo "promotion_pr=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+            PROMOTION_PR="$EXISTING_PR"
 
           else
+
+            echo "Creating Promotion PR..."
 
             PROMOTION_PR=$(gh pr create \
               --base PROD \
               --head "$BRANCH_NAME" \
-              --title "Selective promotion from DEV PR #${PR_NUMBER}" \
-              --body "This PR contains only the explicitly selected stream changes from DEV PR #${PR_NUMBER}." \
+              --title "Selective ${PROJECT} promotion from DEV PR #${PR_NUMBER}" \
+              --body "This PR contains only the ${PROJECT} changes selected for promotion from DEV PR #${PR_NUMBER}." \
               --json number \
               --jq '.number')
 
-            echo "Created promotion PR: #$PROMOTION_PR"
-
-            echo "promotion_pr=$PROMOTION_PR" >> "$GITHUB_OUTPUT"
+            echo "Promotion PR created: #$PROMOTION_PR"
 
           fi
+
+
+          if [ -z "$PROMOTION_PR" ]; then
+
+            echo "ERROR: Promotion PR was not created."
+
+            echo "The original DEV -> PROD PR will NOT be closed."
+
+            exit 1
+
+          fi
+
+
+          echo "promotion_pr=$PROMOTION_PR" >> "$GITHUB_OUTPUT"
 
 
       # -------------------------------------------------------
       # Close original DEV -> PROD PR
       #
-      # This happens ONLY after the promotion PR exists.
+      # This happens ONLY after Promotion PR exists.
       # -------------------------------------------------------
 
       - name: Close original DEV to PROD PR
@@ -263,27 +402,37 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           ORIGINAL_PR: ${{ github.event.pull_request.number }}
           PROMOTION_PR: ${{ steps.create-promotion-pr.outputs.promotion_pr }}
+          PROJECT: ${{ steps.selection.outputs.project }}
         run: |
 
           if [ -z "$PROMOTION_PR" ]; then
-            echo "Promotion PR number not available."
+
+            echo "ERROR: Promotion PR number is missing."
+
             echo "Original PR will remain open."
+
             exit 1
+
           fi
 
-          echo "Promotion PR created: #$PROMOTION_PR"
-          echo "Closing original DEV -> PROD PR: #$ORIGINAL_PR"
+
+          echo "Promotion PR #$PROMOTION_PR exists."
+
+          echo "Closing original DEV -> PROD PR #$ORIGINAL_PR"
+
 
           gh pr comment "$ORIGINAL_PR" \
-            --body "This PR has been automatically closed because selective promotion PR #$PROMOTION_PR was created. Please review and merge the selective promotion PR instead."
+            --body "Selective promotion for **${PROJECT}** has been created as PR #${PROMOTION_PR}. This original DEV → PROD PR is being automatically closed. Please review and merge the selective promotion PR."
+
 
           gh pr close "$ORIGINAL_PR"
+
 
           echo "Original DEV -> PROD PR #$ORIGINAL_PR closed successfully."
 
 
   # =========================================================
-  # 2. NORMAL DEV DEPLOYMENT
+  # 3. DETECT DEV PROJECTS
   # =========================================================
 
   detect-dev-projects:
@@ -302,6 +451,7 @@ jobs:
         with:
           fetch-depth: 0
 
+
       - name: Detect changed DEV projects
         id: set-projects
         shell: bash
@@ -317,6 +467,7 @@ jobs:
             | grep '\.sql$' \
             || true)
 
+
           if [ -z "$changed_files" ]; then
 
             echo "No changed SQL files."
@@ -327,8 +478,10 @@ jobs:
 
           fi
 
+
           echo "Changed files:"
           echo "$changed_files"
+
 
           projects=$(echo "$changed_files" \
             | awk -F/ '{print $2}' \
@@ -336,13 +489,14 @@ jobs:
             | sed 's/$/_DEV/' \
             | jq -R -s -c 'split("\n")[:-1]')
 
+
           echo "Detected projects: $projects"
 
           echo "projects=$projects" >> "$GITHUB_OUTPUT"
 
 
   # =========================================================
-  # 3. DEPLOY TO DEV
+  # 4. DEPLOY TO DEV
   # =========================================================
 
   deploy-dev:
@@ -368,15 +522,18 @@ jobs:
         with:
           fetch-depth: 0
 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install snowflake-connector-python cryptography
+
 
       - name: Parse project config and save private key
         shell: bash
@@ -384,17 +541,27 @@ jobs:
 
           CONFIG_FILE=configs/config.json
 
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Config file not found: $CONFIG_FILE"
+            exit 1
+          fi
+
+
           KEY_PATH=$(jq -r \
             --arg key "$PROJECT" \
             '.[$key].key_path' \
             "$CONFIG_FILE")
 
+
           echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
 
           mkdir -p "$(dirname "$KEY_PATH")"
 
+
           echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
             | tr -d '\r' > "$KEY_PATH"
+
 
       - name: Deploy changed DEV files
         env:
@@ -406,6 +573,7 @@ jobs:
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
 
+
           changed_files=$(git diff \
             --name-only \
             "$PREV_COMMIT" \
@@ -414,12 +582,20 @@ jobs:
             | grep '\.sql$' \
             || true)
 
+
           if [ -z "$changed_files" ]; then
+
             echo "No changed SQL files."
+
             exit 0
+
           fi
 
+
+          echo "Deploying changed files for project $BASE_PROJECT:"
+
           echo "$changed_files"
+
 
           python deploy_sql_files.py \
             --project "$PROJECT" \
@@ -429,9 +605,7 @@ jobs:
 
 
   # =========================================================
-  # 4. PROD DEPLOYMENT
-  #
-  # Runs only after selective promotion PR is merged.
+  # 5. DETECT PROD PROJECTS
   # =========================================================
 
   detect-prod-projects:
@@ -452,12 +626,14 @@ jobs:
         with:
           fetch-depth: 0
 
+
       - name: Detect changed PROD projects
         id: set-projects
         shell: bash
         run: |
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
+
 
           changed_files=$(git diff \
             --name-only \
@@ -466,6 +642,7 @@ jobs:
             | grep '^projects/' \
             | grep '\.sql$' \
             || true)
+
 
           if [ -z "$changed_files" ]; then
 
@@ -477,8 +654,11 @@ jobs:
 
           fi
 
+
           echo "Changed PROD files:"
+
           echo "$changed_files"
+
 
           projects=$(echo "$changed_files" \
             | awk -F/ '{print $2}' \
@@ -486,13 +666,14 @@ jobs:
             | sed 's/$/_PROD/' \
             | jq -R -s -c 'split("\n")[:-1]')
 
+
           echo "Detected PROD projects: $projects"
 
           echo "projects=$projects" >> "$GITHUB_OUTPUT"
 
 
   # =========================================================
-  # 5. DEPLOY TO PROD
+  # 6. DEPLOY TO PROD
   # =========================================================
 
   deploy-prod:
@@ -518,15 +699,18 @@ jobs:
         with:
           fetch-depth: 0
 
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install snowflake-connector-python cryptography
+
 
       - name: Parse project config and save private key
         shell: bash
@@ -534,17 +718,27 @@ jobs:
 
           CONFIG_FILE=configs/config.json
 
+          if [ ! -f "$CONFIG_FILE" ]; then
+            echo "Config file not found: $CONFIG_FILE"
+            exit 1
+          fi
+
+
           KEY_PATH=$(jq -r \
             --arg key "$PROJECT" \
             '.[$key].key_path' \
             "$CONFIG_FILE")
 
+
           echo "KEY_PATH=$KEY_PATH" >> "$GITHUB_ENV"
+
 
           mkdir -p "$(dirname "$KEY_PATH")"
 
+
           echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
             | tr -d '\r' > "$KEY_PATH"
+
 
       - name: Deploy changed PROD files
         env:
@@ -556,6 +750,7 @@ jobs:
 
           PREV_COMMIT=$(git rev-parse HEAD~1)
 
+
           changed_files=$(git diff \
             --name-only \
             "$PREV_COMMIT" \
@@ -564,12 +759,20 @@ jobs:
             | grep '\.sql$' \
             || true)
 
+
           if [ -z "$changed_files" ]; then
+
             echo "No changed SQL files."
+
             exit 0
+
           fi
 
+
+          echo "Deploying changed PROD files for project $BASE_PROJECT:"
+
           echo "$changed_files"
+
 
           python deploy_sql_files.py \
             --project "$PROJECT" \
