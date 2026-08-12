@@ -58,10 +58,14 @@ jobs:
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
 
-      - name: Fetch DEV
+      - name: Fetch DEV and PROD
         run: |
           git fetch origin DEV
           git fetch origin PROD
+
+      # -------------------------------------------------------
+      # Determine which stream(s) should be promoted
+      # -------------------------------------------------------
 
       - name: Determine selected projects
         id: selection
@@ -82,10 +86,19 @@ jobs:
             PROJECTS="${PROJECTS} SCA"
           fi
 
+          if [ -z "$PROJECTS" ]; then
+            echo "No valid promotion label found."
+            exit 1
+          fi
+
           echo "Selected projects:$PROJECTS"
 
           echo "projects=$PROJECTS" >> "$GITHUB_OUTPUT"
 
+
+      # -------------------------------------------------------
+      # Create / reset selective promotion branch from PROD
+      # -------------------------------------------------------
 
       - name: Create selective promotion branch
         id: branch
@@ -97,8 +110,13 @@ jobs:
 
           echo "BRANCH_NAME=$BRANCH_NAME" >> "$GITHUB_OUTPUT"
 
-          git checkout -b "$BRANCH_NAME" origin/PROD
+          # Reset local promotion branch to current PROD
+          git checkout -B "$BRANCH_NAME" origin/PROD
 
+
+      # -------------------------------------------------------
+      # Apply ONLY selected project changes from DEV PR
+      # -------------------------------------------------------
 
       - name: Apply selected project changes
         shell: bash
@@ -111,11 +129,6 @@ jobs:
           echo "Comparing:"
           echo "Base: $PR_BASE_SHA"
           echo "Head: $PR_HEAD_SHA"
-
-          if [ -z "$PROJECTS" ]; then
-            echo "No project selected."
-            exit 1
-          fi
 
           for PROJECT in $PROJECTS
           do
@@ -165,13 +178,15 @@ jobs:
       # -------------------------------------------------------
 
       - name: Commit selective promotion
+        id: commit-promotion
         env:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
 
           if git diff --cached --quiet; then
-            echo "No staged changes to promote."
-            exit 0
+            echo "ERROR: No staged changes to promote."
+            echo "The original DEV -> PROD PR will NOT be closed."
+            exit 1
           fi
 
           echo "Committing selective promotion..."
@@ -181,7 +196,7 @@ jobs:
 
 
       # -------------------------------------------------------
-      # Push promotion branch
+      # Push selective promotion branch
       # -------------------------------------------------------
 
       - name: Push promotion branch
@@ -200,6 +215,7 @@ jobs:
       # -------------------------------------------------------
 
       - name: Create promotion PR
+        id: create-promotion-pr
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH_NAME: ${{ steps.branch.outputs.BRANCH_NAME }}
@@ -209,6 +225,7 @@ jobs:
           EXISTING_PR=$(gh pr list \
             --head "$BRANCH_NAME" \
             --base PROD \
+            --state open \
             --json number \
             --jq '.[0].number')
 
@@ -216,15 +233,53 @@ jobs:
 
             echo "Promotion PR already exists: #$EXISTING_PR"
 
+            echo "promotion_pr=$EXISTING_PR" >> "$GITHUB_OUTPUT"
+
           else
 
-            gh pr create \
+            PROMOTION_PR=$(gh pr create \
               --base PROD \
               --head "$BRANCH_NAME" \
               --title "Selective promotion from DEV PR #${PR_NUMBER}" \
-              --body "This PR contains only the explicitly selected stream changes from DEV PR #${PR_NUMBER}."
+              --body "This PR contains only the explicitly selected stream changes from DEV PR #${PR_NUMBER}." \
+              --json number \
+              --jq '.number')
+
+            echo "Created promotion PR: #$PROMOTION_PR"
+
+            echo "promotion_pr=$PROMOTION_PR" >> "$GITHUB_OUTPUT"
 
           fi
+
+
+      # -------------------------------------------------------
+      # Close original DEV -> PROD PR
+      #
+      # This happens ONLY after the promotion PR exists.
+      # -------------------------------------------------------
+
+      - name: Close original DEV to PROD PR
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          ORIGINAL_PR: ${{ github.event.pull_request.number }}
+          PROMOTION_PR: ${{ steps.create-promotion-pr.outputs.promotion_pr }}
+        run: |
+
+          if [ -z "$PROMOTION_PR" ]; then
+            echo "Promotion PR number not available."
+            echo "Original PR will remain open."
+            exit 1
+          fi
+
+          echo "Promotion PR created: #$PROMOTION_PR"
+          echo "Closing original DEV -> PROD PR: #$ORIGINAL_PR"
+
+          gh pr comment "$ORIGINAL_PR" \
+            --body "This PR has been automatically closed because selective promotion PR #$PROMOTION_PR was created. Please review and merge the selective promotion PR instead."
+
+          gh pr close "$ORIGINAL_PR"
+
+          echo "Original DEV -> PROD PR #$ORIGINAL_PR closed successfully."
 
 
   # =========================================================
@@ -488,7 +543,7 @@ jobs:
 
           mkdir -p "$(dirname "$KEY_PATH")"
 
-          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT) ] }}" \
+          echo "${{ secrets[format('{0}_PRIVATE_KEY', env.PROJECT)] }}" \
             | tr -d '\r' > "$KEY_PATH"
 
       - name: Deploy changed PROD files
