@@ -36,13 +36,11 @@ permissions:
 
 jobs:
 
-  # =========================================================
+    # =========================================================
   # 1. VALIDATE PROMOTION PR
   #
-  # If a DEV -> PROD PR does not have a valid promotion label,
+  # If a DEV -> PROD PR does not have a promotion label,
   # automatically close it.
-  #
-  # This job NEVER performs deployment.
   # =========================================================
 
   validate-promotion-pr:
@@ -67,6 +65,7 @@ jobs:
       - name: Reject PR without promotion label
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
 
@@ -74,11 +73,13 @@ jobs:
           echo "Required label: promote-sourcing OR promote-sca"
 
           gh pr comment "$PR_NUMBER" \
-            --body "This DEV → PROD PR was automatically closed because no promotion label was provided. Add `promote-sourcing` or `promote-sca` when creating the promotion request."
+            --repo "$GH_REPO" \
+            --body "This DEV to PROD PR was automatically closed because no promotion label was provided. Add the promote-sourcing or promote-sca label when creating the promotion request."
 
-          gh pr close "$PR_NUMBER"
+          gh pr close "$PR_NUMBER" \
+            --repo "$GH_REPO"
 
-          echo "Original PR #$PR_NUMBER closed."
+          echo "Original PR #$PR_NUMBER closed successfully."
 
 
   # =========================================================
