@@ -24,6 +24,5 @@ create or replace TABLE DIM_WAVEPOOL_RESEARCH (
 	"Gilbert Qty" NUMBER(29,4),
 	"Gilbert East Qty" NUMBER(29,4),
 	"Gilbert West Qty" NUMBER(29,4),
-	"Wave Type List" VARCHAR(16777216),
-	"AVL FLAG" NUMBER(1,0)
+	"Wave Type List" VARCHAR(16777216)
 );
